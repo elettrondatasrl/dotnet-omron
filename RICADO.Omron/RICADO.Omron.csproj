@@ -36,6 +36,11 @@
   </PropertyGroup>
   
   <ItemGroup>
+    <!-- The tests replace clock and ping of the reconnect policy. -->
+    <InternalsVisibleTo Include="RICADO.Omron.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Remove="Channels\BetterTCPChannel.cs" />
     <Compile Remove="Channels\RequestMessage.cs" />
   </ItemGroup>

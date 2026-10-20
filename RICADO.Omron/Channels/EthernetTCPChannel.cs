@@ -40,6 +40,13 @@ namespace RICADO.Omron.Channels
         /// <summary>True while a socket is open. False after a fault, until the next attempt reopens it.</summary>
         internal bool IsConnected => _client?.Connected == true;
 
+        /// <summary>
+        /// Optional (<see cref="ReconnectPolicy"/>): while the PLC is down it holds requests back
+        /// until the next attempt is due, and it hears the outcome of every request. Null: every
+        /// request goes to the network.
+        /// </summary>
+        internal LinkGuard Guard { get; set; }
+
         internal event EventHandler NeedReinit;
 
         #region ctor and dispose
@@ -104,8 +111,55 @@ namespace RICADO.Omron.Channels
             }
         }
 
-        internal async Task<ProcessRequestResult> ProcessRequestAsync(FINSRequest request, int timeout, int retries, CancellationToken cancellationToken)
+        /// <summary>
+        /// Opens the connection if it is not open, honouring the <see cref="Guard"/>: while the PLC
+        /// is down only when the attempt is due. Never throws, except for a cancellation by the
+        /// caller: false when the PLC could not be reached, or the attempt is not due.
+        /// </summary>
+        internal async Task<bool> TryReconnectAsync(int timeout, CancellationToken cancellationToken)
         {
+            var guard = Guard;
+            if (IsConnected && guard?.IsDown != true) return true;
+            if (guard != null && !await guard.ShouldTryAsync(cancellationToken)) return false;
+
+            if (!await _semaphore.WaitAsync(timeout, cancellationToken)) return false;
+            try
+            {
+                if (!IsConnected)
+                {
+                    await ConnectAsync(timeout, cancellationToken);
+                    errorCounter = 0;
+                }
+                guard?.ReportOk();
+                return true;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception e)
+            {
+                guard?.ReportFault(e);
+                return false;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        /// <param name="gated">
+        /// False for an explicit initialization: the caller asked for an attempt now, so the
+        /// <see cref="Guard"/> does not hold it back (it still hears the outcome).
+        /// </param>
+        internal async Task<ProcessRequestResult> ProcessRequestAsync(FINSRequest request, int timeout, int retries, CancellationToken cancellationToken, bool gated = true)
+        {
+            var guard = Guard;
+            if (gated && guard != null && !await guard.ShouldTryAsync(cancellationToken))
+            {
+                throw new PlcLinkDownException(RemoteHost, Port, guard.DownFor, guard.NextAttemptIn);
+            }
+
             int attempts = 0;
             Exception lastFault = null;
             Memory<byte> responseMessage = new Memory<byte>();
@@ -187,6 +241,7 @@ namespace RICADO.Omron.Channels
                         if (attempts > retries)
                         {
                             IncrementErrorCounter();
+                            guard?.ReportFault(lastFault);
                             throw new OmronException("No Response from Omron PLC '" + RemoteHost + ":" + Port + "' after " + attempts + " Attempts - " + e.Message, lastFault);
                         }
                     }
@@ -204,11 +259,14 @@ namespace RICADO.Omron.Channels
                         Response = FINSResponse.CreateNew(responseMessage, request),
                     };
                     errorCounter = 0;
+                    guard?.ReportOk();
                     return result;
                 }
                 catch (FINSException e)
                 {
+                    // The PLC answered: the link is fine, the request is not.
                     IncrementErrorCounter();
+                    guard?.ReportOk();
                     throw new OmronException("Received a FINS Error Response from Omron PLC '" + RemoteHost + ":" + Port + "'", e);
                 }
             }

@@ -53,6 +53,8 @@ namespace RICADO.Omron
         private bool disposedValue;
         private ConnectionStatus connectionStatus;
         private readonly object _isInitializedLock = new object();
+        private ReconnectPolicy _reconnectPolicy;
+        private LinkGuard _guard;
 
         #endregion
 
@@ -94,6 +96,30 @@ namespace RICADO.Omron
                     StatusChanged?.Invoke(this, new StatusChangedEventArgs(value));
             }
         }
+
+        /// <summary>
+        /// What to do while the PLC does not answer; null (default) sends every request to the
+        /// network, as always. See <see cref="Omron.ReconnectPolicy"/>. It can be set at any time;
+        /// a new policy starts with the PLC considered up.
+        /// </summary>
+        public ReconnectPolicy ReconnectPolicy
+        {
+            get => _reconnectPolicy;
+            set => SetReconnectPolicy(value, null, null);
+        }
+
+        /// <summary>True while the PLC does not answer (only with a <see cref="ReconnectPolicy"/>).</summary>
+        public bool IsLinkDown => _guard?.IsDown == true;
+
+        /// <summary>How long the PLC has not answered; null while it answers or without a policy.</summary>
+        public TimeSpan? LinkDownFor => _guard?.DownFor;
+
+        /// <summary>
+        /// The PLC stopped answering, or answers again (only with a <see cref="ReconnectPolicy"/>).
+        /// Raised on the thread of the request that saw the change; a handler that throws does not
+        /// affect the communication.
+        /// </summary>
+        public event EventHandler<LinkStateChangedEventArgs> LinkStateChanged;
 
         public byte LocalNodeID { get; private set; }
 
@@ -264,7 +290,7 @@ namespace RICADO.Omron
             // Initialize the Channel. A channel left by an earlier attempt goes first, with its
             // socket: on a PLC with few FINS/TCP connections every socket left open is one less.
             DisposeChannel();
-            Channel = new EthernetTCPChannel(RemoteHost, Port);
+            Channel = new EthernetTCPChannel(RemoteHost, Port) { Guard = _guard };
             Channel.NeedReinit += OmronPLC_NeedReinit;
 
             try
@@ -277,10 +303,17 @@ namespace RICADO.Omron
                 DisposeChannel();
                 throw new OmronException("Failed to Create the Ethernet TCP Communication Channel within the Timeout Period for Omron PLC '" + RemoteHost + ":" + Port + "'");
             }
-            catch (Exception)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 ConnectionStatus = ConnectionStatus.Disconnected;
                 DisposeChannel();
+                throw;
+            }
+            catch (Exception e)
+            {
+                ConnectionStatus = ConnectionStatus.Disconnected;
+                DisposeChannel();
+                _guard?.ReportFault(e);
                 throw;
             }
 
@@ -301,6 +334,56 @@ namespace RICADO.Omron
             }
             if (ConnectionStatus != ConnectionStatus.Connected)
                 ConnectionStatus = ConnectionStatus.Initalized;
+        }
+
+        /// <summary>
+        /// For periodic loops: true when the connection is open, or was just reopened. While the
+        /// PLC is down (with a <see cref="ReconnectPolicy"/>) it tries only when the attempt is due,
+        /// so a loop can call it every cycle and skip the cycle on false, without exceptions.
+        /// Never throws, except for a cancellation by the caller; false before
+        /// <see cref="InitializeAsync"/> has succeeded.
+        /// </summary>
+        public Task<bool> TryReconnectAsync(CancellationToken cancellationToken)
+        {
+            var channel = Channel;
+            if (!IsInitialized || channel == null)
+            {
+                return Task.FromResult(false);
+            }
+
+            return channel.TryReconnectAsync(Timeout, cancellationToken);
+        }
+
+        /// <summary>Same as the <see cref="ReconnectPolicy"/> setter, with clock and ping replaceable in tests.</summary>
+        internal void SetReconnectPolicy(ReconnectPolicy policy, Func<DateTime> clock, Func<string, int, Task<bool?>> ping)
+        {
+            var guard = policy == null ? null : new LinkGuard(RemoteHost, policy, clock, ping);
+            if (guard != null)
+            {
+                guard.StateChanged += Guard_StateChanged;
+            }
+
+            var old = _guard;
+            _reconnectPolicy = policy;
+            _guard = guard;
+            if (Channel != null)
+            {
+                Channel.Guard = guard;
+            }
+
+            if (old != null)
+            {
+                old.StateChanged -= Guard_StateChanged;
+            }
+        }
+
+        private void Guard_StateChanged(object sender, LinkStateChangedEventArgs e)
+        {
+            if (e.IsDown)
+            {
+                ConnectionStatus = ConnectionStatus.ConnectionFault;
+            }
+            LinkStateChanged?.Invoke(this, e);
         }
 
         public Task<ReadBitsResult> ReadBitAsync(ushort address, byte bitIndex, MemoryBitDataType dataType, CancellationToken cancellationToken)
@@ -1030,7 +1113,8 @@ namespace RICADO.Omron
             CPUUnitDataResult result = null;
             try
             {
-                ProcessRequestResult requestResult = await Channel.ProcessRequestAsync(request, Timeout, Retries, cancellationToken);
+                // Part of an explicit initialization: not held back by the reconnect policy.
+                ProcessRequestResult requestResult = await Channel.ProcessRequestAsync(request, Timeout, Retries, cancellationToken, gated: false);
                 result = ReadCPUUnitDataResponse.ExtractData(requestResult.Response);
             }
             catch (Exception)
