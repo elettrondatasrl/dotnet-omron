@@ -19,6 +19,8 @@ namespace RICADO.Omron.Channels
         private readonly Func<string, int, Task<bool?>> _ping;
         private readonly ReconnectBackoff _backoff;
         private readonly object _sync = new object();
+        private readonly object _eventsLock = new object();
+        private Task _events = Task.CompletedTask;
         private bool? _pingWorks;
         private int _learning;
 
@@ -34,7 +36,7 @@ namespace RICADO.Omron.Channels
             _backoff = new ReconnectBackoff(policy.Delays.ToArray());
         }
 
-        /// <summary>Raised outside any lock: down (with the cause) or back up (with how long it was down).</summary>
+        /// <summary>Down (with the cause) or back up (with how long it was down); see <see cref="Raise"/>.</summary>
         internal event EventHandler<LinkStateChangedEventArgs> StateChanged;
 
         internal bool IsDown { get { lock (_sync) return _backoff.IsDown; } }
@@ -128,15 +130,26 @@ namespace RICADO.Omron.Channels
             }
         }
 
+        /// <summary>
+        /// On a thread-pool thread, outside every lock of the library and in the order things
+        /// happened: raised inline it would run while the channel holds its semaphore, and a handler
+        /// calling the PLC back would wait for itself.
+        /// </summary>
         private void Raise(LinkStateChangedEventArgs args)
         {
-            try
+            lock (_eventsLock)
             {
-                StateChanged?.Invoke(this, args);
-            }
-            catch
-            {
-                // A failing handler (a logger, a UI update) must not break the communication.
+                _events = _events.ContinueWith(_ =>
+                {
+                    try
+                    {
+                        StateChanged?.Invoke(this, args);
+                    }
+                    catch
+                    {
+                        // A failing handler (a logger, a UI update) must not break the communication.
+                    }
+                }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
             }
         }
 

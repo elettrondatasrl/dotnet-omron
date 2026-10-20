@@ -36,6 +36,17 @@ namespace RICADO.Omron.Tests
             public async Task<ushort> ReadAsync(ushort address = 100)
                 => (await Plc.ReadWordAsync(address, MemoryWordDataType.DataMemory, TestContext.Current.CancellationToken)).Values[0];
 
+            public int EventCount { get { lock (Events) return Events.Count; } }
+
+            /// <summary>The events arrive on the thread pool, a moment later.</summary>
+            public async Task WaitForEventsAsync(int count)
+            {
+                var clock = Stopwatch.StartNew();
+                while (EventCount < count && clock.ElapsedMilliseconds < 3000)
+                    await Task.Delay(10, TestContext.Current.CancellationToken);
+                Assert.Equal(count, EventCount);
+            }
+
             /// <summary>The PLC goes away and a request finds out.</summary>
             public async Task GoDownAsync()
             {
@@ -73,7 +84,8 @@ namespace RICADO.Omron.Tests
             using var rig = await Rig.StartAsync();
             await rig.GoDownAsync();
 
-            var down = Assert.Single(rig.Events);
+            await rig.WaitForEventsAsync(1);
+            var down = rig.Events[0];
             Assert.True(down.IsDown);
             Assert.NotNull(down.Cause);
 
@@ -98,7 +110,7 @@ namespace RICADO.Omron.Tests
             Assert.Equal(7, await rig.ReadAsync());
 
             Assert.False(rig.Plc.IsLinkDown);
-            Assert.Equal(2, rig.Events.Count);
+            await rig.WaitForEventsAsync(2);
             Assert.False(rig.Events[1].IsDown);
             Assert.Equal(TimeSpan.FromSeconds(1), rig.Events[1].DownFor);
         }
@@ -219,6 +231,29 @@ namespace RICADO.Omron.Tests
             rig.Server.Start();
             rig.Now += TimeSpan.FromSeconds(1);
             Assert.Equal(7, await rig.ReadAsync());
+        }
+
+        [Fact]
+        public async Task AHandlerThatCallsThePlcBackDoesNotWaitForItself()
+        {
+            // Raised inline, the handler would run inside the request that brought the PLC back,
+            // with the channel semaphore taken: its own request would wait for it until the timeout.
+            using var rig = await Rig.StartAsync();
+            var handled = new TaskCompletionSource<object>();
+            rig.Plc.LinkStateChanged += (_, e) =>
+            {
+                if (e.IsDown) return;
+                try { handled.TrySetResult(rig.ReadAsync().GetAwaiter().GetResult()); }
+                catch (Exception ex) { handled.TrySetResult(ex); }
+            };
+
+            await rig.GoDownAsync();
+            rig.Server.Start();
+            rig.Now += TimeSpan.FromSeconds(1);
+            Assert.Equal(7, await rig.ReadAsync());
+
+            var outcome = await handled.Task.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+            Assert.Equal((ushort)7, outcome);
         }
 
         [Fact]

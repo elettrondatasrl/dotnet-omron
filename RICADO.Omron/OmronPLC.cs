@@ -116,8 +116,8 @@ namespace RICADO.Omron
 
         /// <summary>
         /// The PLC stopped answering, or answers again (only with a <see cref="ReconnectPolicy"/>).
-        /// Raised on the thread of the request that saw the change; a handler that throws does not
-        /// affect the communication.
+        /// Raised on a thread-pool thread, outside every lock of the library and in order: the
+        /// handler can call the PLC back, and a handler that throws does not affect the communication.
         /// </summary>
         public event EventHandler<LinkStateChangedEventArgs> LinkStateChanged;
 
