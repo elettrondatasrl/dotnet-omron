@@ -10,22 +10,35 @@ using RICADO.Omron.Responses;
 
 namespace RICADO.Omron.Channels
 {
+    /// <summary>
+    /// FINS over TCP towards one PLC.
+    ///
+    /// A socket that failed once is never trusted again: it is thrown away, and the next attempt
+    /// (a retry of the same request, or the next request) opens a new one. Before this rule a
+    /// failed reconnection left the channel refusing every request for good, even when the PLC
+    /// answered again: only a new <see cref="OmronPLC"/> could bring it back.
+    /// </summary>
     internal sealed class EthernetTCPChannel : IDisposable
     {
 
         internal const int TCP_HEADER_LENGTH = 16;
+
+        // Byte of the FINS header where the PLC echoes the Service ID of the request.
+        private const int FINS_SERVICE_ID_INDEX = 9;
 
         private byte _requestId = 0;
         private TcpClient _client;
         private SemaphoreSlim _semaphore;
         private bool disposedValue;
         private byte errorCounter = 0;
-        private bool initOk = false;
 
         internal string RemoteHost { get; }
         internal int Port { get; }
         internal byte LocalNodeID { get; private set; }
         internal byte RemoteNodeID { get; private set; }
+
+        /// <summary>True while a socket is open. False after a fault, until the next attempt reopens it.</summary>
+        internal bool IsConnected => _client?.Connected == true;
 
         internal event EventHandler NeedReinit;
 
@@ -72,54 +85,29 @@ namespace RICADO.Omron.Channels
 
         #region internal methods
 
+        /// <summary>Opens the connection now, replacing any socket left by an earlier one.</summary>
         internal async Task InitializeAsync(int timeout, CancellationToken cancellationToken)
         {
-            initOk = false;
+            if (!await _semaphore.WaitAsync(timeout, cancellationToken))
+            {
+                throw new TimeoutException("Timeout out waiting for semaphore");
+            }
+
             try
             {
-#if CONCURRENT
-                if (await _semaphore.WaitAsync(timeout, cancellationToken))
-                {
-                try
-                {
-#endif
-                DestroyClient();
-                await InitializeClientAsync(timeout, cancellationToken);
+                await ConnectAsync(timeout, cancellationToken);
                 errorCounter = 0;
-                initOk = true;
-#if CONCURRENT
-                    }
-                    finally
-                    {
-                        _semaphore.Release();
-                    }
-                }
-                else
-                {
-                    throw new TimeoutException("Timeout out waiting for semaphore");
-                }
-#endif
             }
-            catch (ObjectDisposedException)
+            finally
             {
-                throw new OmronException("Failed to Re-Connect to Omron PLC '" + RemoteHost + ":" + Port + "' - The underlying Socket Connection was Closed");
-            }
-            catch (TimeoutException)
-            {
-                throw new OmronException("Failed to Re-Connect within the Timeout Period to Omron PLC '" + RemoteHost + ":" + Port + "'");
-            }
-            catch (SocketException e)
-            {
-                throw new OmronException("Failed to Re-Connect to Omron PLC '" + RemoteHost + ":" + Port + "'", e);
+                _semaphore.Release();
             }
         }
 
         internal async Task<ProcessRequestResult> ProcessRequestAsync(FINSRequest request, int timeout, int retries, CancellationToken cancellationToken)
         {
-            if (!initOk)
-                throw new OmronException("This Omron PLC must be Initialized first before any Requests can be Processed");
-
             int attempts = 0;
+            Exception lastFault = null;
             Memory<byte> responseMessage = new Memory<byte>();
             int bytesSent = 0;
             int packetsSent = 0;
@@ -127,103 +115,112 @@ namespace RICADO.Omron.Channels
             int packetsReceived = 0;
             DateTime startTimestamp = DateTime.UtcNow;
 
-            if (await _semaphore.WaitAsync(timeout, cancellationToken))
+            if (!await _semaphore.WaitAsync(timeout, cancellationToken))
             {
-                try
+                IncrementErrorCounter();
+                throw new TimeoutException("Timeout out waiting for semaphore");
+            }
+
+            try
+            {
+                while (true)
                 {
-                    while (attempts <= retries)
-                    {
-                        try
-                        {
-                            if (attempts > 0)
-                            {
-                                await InitializeAsync(timeout, cancellationToken);
-                            }
-
-                            //Stopwatch sw = Stopwatch.StartNew();
-
-                            // Build the Request into a Message we can Send
-                            byte[] requestMessage = request.BuildMessage(GetNextRequestId());
-
-                            // Send the Message
-#if CONCURRENT
-                            SendMessageResult sendResult = await SendMessageAsync(TcpCommandCode.FINSFrame, requestMessage, timeout, cancellationToken);
-#else
-                            SendMessageResult sendResult = SendMessage(TcpCommandCode.FINSFrame, requestMessage, timeout);
-#endif
-                            bytesSent += sendResult.Bytes;
-                            packetsSent += sendResult.Packets;
-
-                            // Receive a Response
-#if CONCURRENT
-                            ReceiveMessageResult receiveResult = await ReceiveMessageAsync(TcpCommandCode.FINSFrame, timeout, cancellationToken);
-#else
-                            ReceiveMessageResult receiveResult = ReceiveMessage(TcpCommandCode.FINSFrame, timeout);
-#endif
-                            bytesReceived += receiveResult.Bytes;
-                            packetsReceived += receiveResult.Packets;
-                            responseMessage = receiveResult.Message;
-
-                            //sw.Stop();
-                            //Console.WriteLine($"PLC RTT {sw.ElapsedMilliseconds}ms");
-                            //sw = null;
-
-                            break;
-                        }
-                        catch (Exception)
-                        {
-                            // Increment the Attempts
-                            attempts++;
-                        }
-                    }
-
-                    if (attempts > retries)
-                    {
-                        IncrementErrorCounter(timeout, cancellationToken);
-                        throw new OmronException("Max retries");
-                    }
-
                     try
                     {
-                        return new ProcessRequestResult
+                        if (_client == null)
                         {
-                            BytesSent = bytesSent,
-                            PacketsSent = packetsSent,
-                            BytesReceived = bytesReceived,
-                            PacketsReceived = packetsReceived,
-                            Duration = DateTime.UtcNow.Subtract(startTimestamp).TotalMilliseconds,
-                            Response = FINSResponse.CreateNew(responseMessage, request),
-                        };
-                    }
-                    catch (FINSException e)
-                    {
-                        if (e.Message.Contains("Service ID") && responseMessage.Length >= 9 && responseMessage.Span[9] != request.ServiceID)
-                        {
-#if CONCURRENT
-                            PurgeReceiveBuffer(timeout, cancellationToken).Wait(cancellationToken);
-#else
-                            PurgeReceiveBuffer(timeout);
-#endif
+                            await ConnectAsync(timeout, cancellationToken);
                         }
-                        IncrementErrorCounter(timeout, cancellationToken);
-                        throw new OmronException("Received a FINS Error Response from Omron PLC '" + RemoteHost + ":" + Port + "'", e);
+
+                        //Stopwatch sw = Stopwatch.StartNew();
+
+                        // Build the Request into a Message we can Send
+                        byte[] requestMessage = request.BuildMessage(GetNextRequestId(), LocalNodeID, RemoteNodeID);
+
+                        // Send the Message
+#if CONCURRENT
+                        SendMessageResult sendResult = await SendMessageAsync(TcpCommandCode.FINSFrame, requestMessage, timeout, cancellationToken);
+#else
+                        SendMessageResult sendResult = SendMessage(TcpCommandCode.FINSFrame, requestMessage, timeout);
+#endif
+                        bytesSent += sendResult.Bytes;
+                        packetsSent += sendResult.Packets;
+
+                        // Receive a Response
+#if CONCURRENT
+                        ReceiveMessageResult receiveResult = await ReceiveMessageAsync(TcpCommandCode.FINSFrame, timeout, cancellationToken);
+#else
+                        ReceiveMessageResult receiveResult = ReceiveMessage(TcpCommandCode.FINSFrame, timeout);
+#endif
+                        bytesReceived += receiveResult.Bytes;
+                        packetsReceived += receiveResult.Packets;
+                        responseMessage = receiveResult.Message;
+
+                        //sw.Stop();
+                        //Console.WriteLine($"PLC RTT {sw.ElapsedMilliseconds}ms");
+                        //sw = null;
+
+                        // The PLC echoes the Service ID. A different one is the answer to an older
+                        // request, left in the socket by a timeout: from here on every answer would
+                        // belong to the request before. The stream is out of step and is dropped.
+                        byte serviceId = responseMessage.Span[FINS_SERVICE_ID_INDEX];
+                        if (serviceId != request.ServiceID)
+                        {
+                            throw new OmronException("Received a FINS Response for another Request from Omron PLC '" + RemoteHost + ":" + Port + "' - Service ID '" + serviceId + "' instead of '" + request.ServiceID + "'");
+                        }
+
+                        break;
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        // Cancelled by the caller: a conversation cut halfway leaves the socket out of step.
+                        DestroyClient();
+                        throw;
+                    }
+                    catch (Exception e)
+                    {
+                        // The socket cannot be trusted any more: the next attempt opens a new one.
+                        DestroyClient();
+                        lastFault = e;
+                        attempts++;
+
+                        if (attempts > retries)
+                        {
+                            IncrementErrorCounter();
+                            throw new OmronException("No Response from Omron PLC '" + RemoteHost + ":" + Port + "' after " + attempts + " Attempts - " + e.Message, lastFault);
+                        }
                     }
                 }
-                finally
+
+                try
                 {
-                    _semaphore.Release();
+                    var result = new ProcessRequestResult
+                    {
+                        BytesSent = bytesSent,
+                        PacketsSent = packetsSent,
+                        BytesReceived = bytesReceived,
+                        PacketsReceived = packetsReceived,
+                        Duration = DateTime.UtcNow.Subtract(startTimestamp).TotalMilliseconds,
+                        Response = FINSResponse.CreateNew(responseMessage, request),
+                    };
+                    errorCounter = 0;
+                    return result;
+                }
+                catch (FINSException e)
+                {
+                    IncrementErrorCounter();
+                    throw new OmronException("Received a FINS Error Response from Omron PLC '" + RemoteHost + ":" + Port + "'", e);
                 }
             }
-            else
+            finally
             {
-                IncrementErrorCounter(timeout, cancellationToken);
-                throw new TimeoutException("Timeout out waiting for semaphore");
+                _semaphore.Release();
             }
         }
 
         #endregion
 
-        private void IncrementErrorCounter(int timeout, CancellationToken cancellationToken)
+        private void IncrementErrorCounter()
         {
             errorCounter++;
             if (errorCounter >= 5)
@@ -238,9 +235,64 @@ namespace RICADO.Omron.Channels
             {
                 _client?.Dispose();
             }
+            catch
+            {
+                // the socket is already broken
+            }
             finally
             {
                 _client = null;
+            }
+        }
+
+        /// <summary>
+        /// Opens a new socket and negotiates the FINS node addresses, within <paramref name="timeout"/>
+        /// for the TCP connection and for each message of the negotiation. Without its own limit the
+        /// connection towards a PLC that does not answer waits as long as Windows decides, about 20 s.
+        /// On failure no socket is left open. The caller holds the semaphore.
+        /// </summary>
+        private async Task ConnectAsync(int timeout, CancellationToken cancellationToken)
+        {
+            DestroyClient();
+
+            try
+            {
+                await InitializeClientAsync(timeout, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                DestroyClient();
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                DestroyClient();
+                throw new OmronException("Failed to Connect to Omron PLC '" + RemoteHost + ":" + Port + "' within the Timeout Period of " + timeout + "ms", new TimeoutException());
+            }
+            catch (OmronException)
+            {
+                DestroyClient();
+                throw;
+            }
+            catch (ObjectDisposedException)
+            {
+                DestroyClient();
+                throw new OmronException("Failed to Connect to Omron PLC '" + RemoteHost + ":" + Port + "' - The underlying Socket Connection was Closed");
+            }
+            catch (TimeoutException e)
+            {
+                DestroyClient();
+                throw new OmronException("Failed to Connect to Omron PLC '" + RemoteHost + ":" + Port + "' within the Timeout Period", e);
+            }
+            catch (SocketException e)
+            {
+                DestroyClient();
+                throw new OmronException("Failed to Connect to Omron PLC '" + RemoteHost + ":" + Port + "'", e);
+            }
+            catch (Exception)
+            {
+                DestroyClient();
+                throw;
             }
         }
 
@@ -254,7 +306,11 @@ namespace RICADO.Omron.Channels
             _client.SendTimeout = timeout;
             _client.NoDelay = true;
 
-            await _client.ConnectAsync(RemoteHost, Port, cancellationToken);
+            using (var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                limit.CancelAfter(timeout);
+                await _client.ConnectAsync(RemoteHost, Port, limit.Token);
+            }
 
             _client.Client.ReceiveTimeout = timeout;
             _client.Client.SendTimeout = timeout;
@@ -299,56 +355,6 @@ namespace RICADO.Omron.Channels
             catch (OmronException e)
             {
                 throw new OmronException("Failed to Negotiate a TCP Connection with Omron PLC '" + RemoteHost + ":" + Port + "'", e);
-            }
-        }
-
-#if CONCURRENT
-        private async Task PurgeReceiveBuffer(int timeout, CancellationToken cancellationToken)
-#else
-        private void PurgeReceiveBuffer(int timeout)
-#endif
-        {
-            try
-            {
-                if (_client.Connected == false)
-                {
-                    return;
-                }
-
-                if (_client.Available == 0)
-                {
-#if CONCURRENT
-                    await Task.Delay(timeout / 4);
-#else
-                    Task.Delay(timeout / 4).Wait();
-#endif
-                }
-
-                DateTime startTimestamp = DateTime.UtcNow;
-#if CONCURRENT
-                Memory<byte> buffer = new byte[2000];
-#else
-                byte[] buffer = new byte[2048];
-#endif
-
-                while (_client.Connected && _client.Available > 0 && DateTime.UtcNow.Subtract(startTimestamp).TotalMilliseconds < timeout)
-                {
-                    try
-                    {
-#if CONCURRENT
-                        await _client.Client.ReceiveAsync(buffer, cancellationToken);
-#else
-                        _client.Client.Receive(buffer);
-#endif
-                    }
-                    catch
-                    {
-                        return;
-                    }
-                }
-            }
-            catch
-            {
             }
         }
 
@@ -435,13 +441,16 @@ namespace RICADO.Omron.Channels
                     Memory<byte> buffer = byteBuffer;
 #endif
 
-                    if (receivedBytes > 0)
+                    // Zero bytes: the PLC closed the connection. Waiting would only spin until the timeout.
+                    if (receivedBytes == 0)
                     {
-                        receivedData.AddRange(buffer.Slice(0, receivedBytes).ToArray());
-
-                        result.Bytes += receivedBytes;
-                        result.Packets += 1;
+                        throw new OmronException("Failed to Receive FINS Message from Omron PLC '" + RemoteHost + ":" + Port + "' - The Connection was Closed by the PLC");
                     }
+
+                    receivedData.AddRange(buffer.Slice(0, receivedBytes).ToArray());
+
+                    result.Bytes += receivedBytes;
+                    result.Packets += 1;
                 }
 
                 #region checks
@@ -536,11 +545,12 @@ namespace RICADO.Omron.Channels
                         Memory<byte> buffer = byteBuffer;
 #endif
 
-
-                        if (receivedBytes > 0)
+                        if (receivedBytes == 0)
                         {
-                            receivedData.AddRange(buffer.Slice(0, receivedBytes).ToArray());
+                            throw new OmronException("Failed to Receive FINS Message from Omron PLC '" + RemoteHost + ":" + Port + "' - The Connection was Closed by the PLC");
                         }
+
+                        receivedData.AddRange(buffer.Slice(0, receivedBytes).ToArray());
 
                         result.Bytes += receivedBytes;
                         result.Packets += 1;
@@ -577,11 +587,6 @@ namespace RICADO.Omron.Channels
             catch (SocketException e)
             {
                 throw new OmronException("Failed to Receive FINS Message from Omron PLC '" + RemoteHost + ":" + Port + "'", e);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(ex.Message);
-                throw;
             }
 
             return result;

@@ -218,12 +218,7 @@ namespace RICADO.Omron
                 if (disposing)
                 {
                     // TODO: dispose managed state (managed objects)
-                    if (Channel != null)
-                    {
-                        Channel.Dispose();
-
-                        Channel = null;
-                    }
+                    DisposeChannel();
 
                     lock (_isInitializedLock)
                     {
@@ -266,32 +261,39 @@ namespace RICADO.Omron
                 }
             }
 
-            // Initialize the Channel
+            // Initialize the Channel. A channel left by an earlier attempt goes first, with its
+            // socket: on a PLC with few FINS/TCP connections every socket left open is one less.
+            DisposeChannel();
+            Channel = new EthernetTCPChannel(RemoteHost, Port);
+            Channel.NeedReinit += OmronPLC_NeedReinit;
+
             try
             {
-                Channel = new EthernetTCPChannel(RemoteHost, Port);
-                (Channel as EthernetTCPChannel).NeedReinit += OmronPLC_NeedReinit;
-
                 await Channel.InitializeAsync(Timeout, cancellationToken);
-            }
-            catch (ObjectDisposedException)
-            {
-                ConnectionStatus = ConnectionStatus.Disconnected;
-                throw new OmronException("Failed to Create the Ethernet TCP Communication Channel for Omron PLC '" + RemoteHost + ":" + Port + "' - The underlying Socket Connection has been Closed");
             }
             catch (TimeoutException)
             {
                 ConnectionStatus = ConnectionStatus.Disconnected;
+                DisposeChannel();
                 throw new OmronException("Failed to Create the Ethernet TCP Communication Channel within the Timeout Period for Omron PLC '" + RemoteHost + ":" + Port + "'");
             }
-            catch (System.Net.Sockets.SocketException e)
+            catch (Exception)
             {
                 ConnectionStatus = ConnectionStatus.Disconnected;
-                throw new OmronException("Failed to Create the Ethernet TCP Communication Channel for Omron PLC '" + RemoteHost + ":" + Port + "'", e);
+                DisposeChannel();
+                throw;
             }
 
             // Get all controller info
-            await RequestControllerInformation(cancellationToken);
+            try
+            {
+                await RequestControllerInformation(cancellationToken);
+            }
+            catch (Exception)
+            {
+                DisposeChannel();
+                throw;
+            }
 
             lock (_isInitializedLock)
             {
@@ -947,6 +949,19 @@ namespace RICADO.Omron
         {
             ConnectionStatus = ConnectionStatus.ConnectionFault;
             NeedReinit?.Invoke(this, e);
+        }
+
+        private void DisposeChannel()
+        {
+            var channel = Channel;
+            if (channel == null)
+            {
+                return;
+            }
+
+            channel.NeedReinit -= OmronPLC_NeedReinit;
+            channel.Dispose();
+            Channel = null;
         }
 
         private bool ValidateBitAddress(ushort address, MemoryBitDataType dataType)

@@ -53,8 +53,15 @@ namespace RICADO.Omron.Requests
             return bytes;
         }
 
-        internal byte[] BuildMessage(byte requestId)
+        /// <summary>
+        /// Builds the frame with the node addresses negotiated by the connection the frame travels on.
+        /// After a reconnection the PLC may assign a different client node: the ones read when the
+        /// request was created would belong to the old connection.
+        /// </summary>
+        internal byte[] BuildMessage(byte requestId, byte localNodeId, byte remoteNodeId)
         {
+            LocalNodeID = localNodeId;
+            RemoteNodeID = remoteNodeId;
             ServiceID = requestId;
             var bytes = new byte[HEADER_LENGTH + 2 + Body.Length];
             var header = Header();
