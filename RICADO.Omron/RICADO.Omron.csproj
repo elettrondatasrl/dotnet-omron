@@ -1,8 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!--
+    net10.0 too: the library calls no Windows API, and an application that must still run on
+    Windows 10 (EBatch, net10.0-windows10.0.19041.0) cannot reference a library whose minimum is
+    Windows 11. Applications on the Windows TFM (PLCTools, ChronoBus) keep getting that build.
+  -->
   <PropertyGroup>
-    <TargetFramework>net10.0-windows10.0.22000.0</TargetFramework>
-    <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
+    <TargetFrameworks>net10.0-windows10.0.22000.0;net10.0</TargetFrameworks>
     <Description>An Omron PLC Communication Library for .NET 10 Applications</Description>
     <IncludeSymbols>true</IncludeSymbols>
     <AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
@@ -13,11 +17,15 @@
     <Platforms>x64</Platforms>
     <AppendTargetFrameworkTooutputsPath>false</AppendTargetFrameworkTooutputsPath>
     <AppendRuntimeIdentifierTooutputsPath>false</AppendRuntimeIdentifierTooutputsPath>
-    <EnableMsixTooling>true</EnableMsixTooling>
-    <GenerateLibraryLayout>true</GenerateLibraryLayout>
     <DebugType>embedded</DebugType>
   </PropertyGroup>
-  
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows10.0.22000.0'">
+    <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <GenerateLibraryLayout>true</GenerateLibraryLayout>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">
     <OutputPath>bin\x64\Debug\</OutputPath>
     <PlatformTarget>x64</PlatformTarget>
